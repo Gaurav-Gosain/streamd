@@ -1,6 +1,6 @@
 <div align="center">
   <h1>streamd</h1>
-  <p>A CLI tool that streams OpenAI-compatible chat completion responses and renders markdown in the terminal using glamour.</p>
+  <p>A CLI tool that renders streamed LLM output as beautiful markdown in the terminal.</p>
 
   <a href="https://github.com/Gaurav-Gosain/streamd/releases"><img src="https://img.shields.io/github/release/Gaurav-Gosain/streamd.svg" alt="Latest Release"></a>
   <a href="https://pkg.go.dev/github.com/Gaurav-Gosain/streamd?tab=doc"><img src="https://godoc.org/github.com/Gaurav-Gosain/streamd?status.svg" alt="GoDoc"></a>
@@ -8,13 +8,14 @@
 
 ---
 
-streamd takes streaming SSE output from any OpenAI-compatible endpoint (piped via `curl` or similar) and renders it as beautifully formatted markdown in the terminal. It supports reasoning/thinking tokens and offers both an inline streaming mode and an interactive alt-screen mode with scrolling.
+streamd takes piped input from any LLM CLI or API endpoint and renders it as beautifully formatted markdown in the terminal. It auto-detects the input format and just works — whether you're piping from `curl`, `ollama run`, or plain text.
 
 <details>
 <summary>Table of Contents</summary>
 
 - [Installation](#installation)
 - [Usage](#usage)
+- [Supported Formats](#supported-formats)
 - [Features](#features)
 - [Modes](#modes)
 - [Thinking / Reasoning Support](#thinking--reasoning-support)
@@ -46,13 +47,32 @@ brew install streamd
 ## Usage
 
 ```bash
-# Stream a chat completion with rendered markdown
+# Ollama CLI — just pipe it
+ollama run gemma3:4b "explain quicksort" | streamd
+
+# Ollama native /api/chat
+curl -s http://localhost:11434/api/chat \
+  -d '{"model":"gemma3:4b","messages":[{"role":"user","content":"hello"}],"stream":true}' | streamd
+
+# Ollama /api/generate
+curl -s http://localhost:11434/api/generate \
+  -d '{"model":"gemma3:4b","prompt":"explain quicksort","stream":true}' | streamd
+
+# OpenAI-compatible endpoint
 curl -s https://api.example.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"...","messages":[{"role":"user","content":"hello"}],"stream":true}' | streamd
 
+# Any plain text or markdown
+cat README.md | streamd
+echo "# Hello **world**" | streamd
+
 # Alt-screen mode with scrollable viewport
-curl -s ... | streamd --alt
+ollama run gemma3:4b "explain quicksort" | streamd --alt
+
+# Show model info and token usage
+curl -s http://localhost:11434/api/chat \
+  -d '{"model":"gemma3:4b","messages":[...],"stream":true}' | streamd --info
 
 # Hide thinking/reasoning output
 curl -s ... | streamd --no-think
@@ -67,16 +87,31 @@ curl -s ... | streamd --style dracula
 |------|-------|---------|-------------|
 | `--alt` | | `false` | Interactive alt-screen with viewport scrolling |
 | `--no-think` | | `false` | Hide thinking/reasoning output |
+| `--info` | `-i` | `false` | Show model name, token usage, and speed after response |
 | `--style` | | `dark` | Glamour style: `dark`, `light`, `dracula`, `tokyo-night`, `pink`, `ascii` |
 | `--wrap` | `-w` | `0` | Word wrap width (0 = terminal width) |
 
 The style can also be set via the `GLAMOUR_STYLE` environment variable.
 
+## Supported Formats
+
+streamd auto-detects the input format — no flags or configuration needed.
+
+| Format | Source | Example |
+|--------|--------|---------|
+| **Plain text / Markdown** | `ollama run`, `cat`, `echo`, any CLI | `ollama run gemma3 "hi" \| streamd` |
+| **Ollama `/api/chat`** | NDJSON streaming | `curl -s .../api/chat -d '...' \| streamd` |
+| **Ollama `/api/generate`** | NDJSON streaming | `curl -s .../api/generate -d '...' \| streamd` |
+| **OpenAI Chat Completions** | SSE streaming & non-streaming | `curl -s .../v1/chat/completions -d '...' \| streamd` |
+| **OpenAI Responses API** | SSE with `response.output_text.delta` events | `curl -s .../v1/responses -d '...' \| streamd` |
+
 ## Features
 
 - **Live markdown rendering** using [glamour](https://github.com/charmbracelet/glamour) (v2-exp) with syntax-highlighted code blocks, styled headings, lists, tables, and more
+- **Universal input** — auto-detects SSE, NDJSON, and plain text so it works with any LLM tool
 - **Flicker-free streaming** via synchronized terminal output (`DECSYNC`) and debounced re-rendering
 - **Thinking/reasoning support** for models that expose chain-of-thought, via the `reasoning_content` SSE field or inline `<think>...</think>` tags
+- **Usage info** (`--info`) — shows model name, token counts, speed (tok/s), and duration
 - **Interactive alt-screen mode** powered by [bubbletea](https://github.com/charmbracelet/bubbletea) with a scrollable viewport, scroll progress bar, and keyboard navigation
 - **Multiple themes** including dark, light, dracula, tokyo-night, and pink
 - **Auto-detected terminal width** for proper word wrapping

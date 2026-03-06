@@ -29,14 +29,17 @@ type tuiModel struct {
 	height     int
 	thinking   string
 	content    string
+	displayPos int
 	inThink    bool
 	showThink  bool
+	showInfo   bool
 	styleName  string
 	events     <-chan sseEvent
 	done       bool
 	dirty      bool
 	renderer   *glamour.TermRenderer
 	autoScroll bool
+	meta       *streamMeta
 }
 
 type (
@@ -62,7 +65,7 @@ func waitForSSE(ch <-chan sseEvent) tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg {
+	return tea.Tick(30*time.Millisecond, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -98,6 +101,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dirty = true
 
 	case sseMsg:
+		if msg.Meta != nil {
+			m.meta = msg.Meta
+		}
 		if msg.Done {
 			m.done = true
 			m.dirty = true
@@ -117,9 +123,19 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForSSE(m.events)
 
 	case tickMsg:
-		if m.dirty {
+		target := len(m.content)
+		advanced := false
+		if m.displayPos < target {
+			if m.done {
+				m.displayPos = target
+			} else {
+				m.displayPos = nextWordBoundary(m.content, m.displayPos)
+			}
+			advanced = true
+		}
+		if m.dirty || advanced {
 			m.dirty = false
-			md := buildMd(m.thinking, m.content, m.showThink)
+			md := buildMd(m.thinking, m.content[:m.displayPos], m.showThink)
 			if md != "" {
 				out, err := m.renderer.Render(md)
 				if err != nil {
@@ -162,18 +178,50 @@ func (m tuiModel) View() tea.View {
 	if m.done {
 		status = tuiStatusStyle.Render("done")
 	}
+
+	var info string
+	if m.showInfo && m.meta != nil {
+		info = tuiDimStyle.Render(formatMeta(m.meta))
+	}
+
 	keys := tuiDimStyle.Render("q/esc quit  j/k scroll  g/G top/bottom")
-	gap := max(0, m.width-lipgloss.Width(status)-lipgloss.Width(keys))
-	b.WriteString(status)
-	b.WriteString(strings.Repeat(" ", gap))
-	b.WriteString(keys)
+
+	if info != "" {
+		left := status + "  " + info
+		gap := max(0, m.width-lipgloss.Width(left)-lipgloss.Width(keys))
+		b.WriteString(left)
+		b.WriteString(strings.Repeat(" ", gap))
+		b.WriteString(keys)
+	} else {
+		gap := max(0, m.width-lipgloss.Width(status)-lipgloss.Width(keys))
+		b.WriteString(status)
+		b.WriteString(strings.Repeat(" ", gap))
+		b.WriteString(keys)
+	}
 
 	v := tea.NewView(b.String())
 	v.AltScreen = true
 	return v
 }
 
-func runTUI(style string, width int, showThink bool) error {
+func formatMeta(m *streamMeta) string {
+	var parts []string
+	if m.Model != "" {
+		parts = append(parts, m.Model)
+	}
+	if m.TotalTokens > 0 {
+		parts = append(parts, fmt.Sprintf("%dt", m.TotalTokens))
+	} else if m.EvalCount > 0 {
+		parts = append(parts, fmt.Sprintf("%dt", m.PromptEvalCount+m.EvalCount))
+	}
+	if m.TotalDuration > 0 && m.EvalCount > 0 {
+		tps := float64(m.EvalCount) / m.TotalDuration.Seconds()
+		parts = append(parts, fmt.Sprintf("%.0f tok/s", tps))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func runTUI(style string, width int, showThink, showInfo bool) error {
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStandardStyle(style),
 		glamour.WithWordWrap(width),
@@ -183,13 +231,14 @@ func runTUI(style string, width int, showThink bool) error {
 	}
 
 	ch := make(chan sseEvent, 256)
-	go readSSE(ch)
+	go readEvents(ch)
 
 	m := tuiModel{
 		viewport:   viewport.New(),
 		events:     ch,
 		renderer:   r,
 		showThink:  showThink,
+		showInfo:   showInfo,
 		styleName:  style,
 		autoScroll: true,
 	}
