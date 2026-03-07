@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	glamour "charm.land/glamour/v2"
 	styles "charm.land/glamour/v2/styles"
 
 	"charm.land/fang/v2"
@@ -345,7 +344,7 @@ func run(opts options) error {
 	if opts.alt {
 		return runTUI(style, width, showThink, opts.info)
 	}
-	return runStream(style, width, showThink, opts.info)
+	return runInline(style, width, showThink, opts.info)
 }
 
 // nextWordBoundary returns the byte offset just past the next word after pos.
@@ -355,83 +354,6 @@ func nextWordBoundary(s string, pos int) int {
 		return len(s)
 	}
 	return pos + i + 1
-}
-
-// runStream is the non-alt inline streaming mode.
-func runStream(style string, width int, showThink, showInfo bool) error {
-	r, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle(style),
-		glamour.WithWordWrap(width),
-	)
-	if err != nil {
-		return err
-	}
-
-	ch := make(chan sseEvent, 256)
-	go readEvents(ch)
-
-	var thinking, content strings.Builder
-	var inThink bool
-	var meta *streamMeta
-	displayPos := 0
-	prev := 0
-	done := false
-
-	ticker := time.NewTicker(30 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		if done && displayPos >= content.Len() {
-			break
-		}
-
-		select {
-		case ev, ok := <-ch:
-			if !ok {
-				ch = nil
-				done = true
-				continue
-			}
-			if ev.Meta != nil {
-				meta = ev.Meta
-			}
-			if ev.ReasoningContent != "" {
-				thinking.WriteString(ev.ReasoningContent)
-			}
-			if ev.Content != "" {
-				td, cd, next := parseContent(ev.Content, inThink)
-				thinking.WriteString(td)
-				content.WriteString(cd)
-				inThink = next
-			}
-			if ev.Done {
-				ch = nil
-				done = true
-			}
-
-		case <-ticker.C:
-			target := content.Len()
-			if displayPos < target {
-				if done {
-					// Stream finished — reveal everything immediately
-					displayPos = target
-				} else {
-					displayPos = nextWordBoundary(content.String(), displayPos)
-				}
-				prev = renderFrame(r, thinking.String(), content.String()[:displayPos], showThink, prev)
-			}
-		}
-	}
-
-	// Final render
-	renderFrame(r, thinking.String(), content.String(), showThink, prev)
-	fmt.Println()
-
-	if showInfo && meta != nil {
-		printMeta(meta)
-	}
-
-	return nil
 }
 
 func printMeta(m *streamMeta) {
@@ -491,29 +413,6 @@ func parseContent(text string, inThink bool) (thinkDelta, contentDelta string, n
 		}
 	}
 	return tb.String(), cb.String(), inThink
-}
-
-// renderFrame renders a full frame to stdout with synchronized output.
-func renderFrame(r *glamour.TermRenderer, thinking, content string, showThink bool, prevLines int) int {
-	md := buildMd(thinking, content, showThink)
-	if md == "" {
-		return prevLines
-	}
-
-	out, err := r.Render(md)
-	if err != nil {
-		out = md
-	}
-
-	var buf strings.Builder
-	buf.WriteString("\033[?2026h")
-	if prevLines > 0 {
-		fmt.Fprintf(&buf, "\033[%dA\033[J", prevLines)
-	}
-	buf.WriteString(out)
-	buf.WriteString("\033[?2026l")
-	_, _ = os.Stdout.WriteString(buf.String())
-	return strings.Count(out, "\n")
 }
 
 // buildMd composes the final markdown from thinking + content.
