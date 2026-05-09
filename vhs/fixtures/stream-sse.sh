@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Emit OpenAI Chat Completions SSE chunks with a short delay between
-# tokens so the demo looks like a real streaming response.
+# Emit OpenAI Chat Completions SSE chunks. Streams by small character
+# chunks so all whitespace (including code indentation and newlines)
+# is preserved exactly as written.
 
 set -e
 
@@ -8,10 +9,11 @@ emit() {
   local content="$1"
   printf 'data: {"choices":[{"delta":{"content":%s}}],"model":"demo"}\n\n' \
     "$(printf '%s' "$content" | jq -Rs .)"
-  sleep 0.03
+  sleep 0.018
 }
 
-text='# Quicksort
+read -r -d '' text <<'EOF' || true
+# Quicksort
 
 Quicksort is a **divide-and-conquer** sorting algorithm with average
 `O(n log n)` time complexity.
@@ -19,7 +21,7 @@ Quicksort is a **divide-and-conquer** sorting algorithm with average
 ## How it works
 
 1. Pick a *pivot* element from the array.
-2. **Partition** the rest into two groups: less than pivot, greater than pivot.
+2. **Partition** the rest into two groups.
 3. Recursively sort each partition.
 
 ## Implementation
@@ -45,14 +47,17 @@ func quicksort(arr []int) []int {
 }
 ```
 
-That is the whole algorithm in 15 lines of Go.'
+That is the whole algorithm in 15 lines of Go.
+EOF
 
-# Stream word-by-word for a realistic streaming feel.
-while IFS= read -r line; do
-  for word in $line; do
-    emit "$word "
-  done
-  emit $'\n'
-done <<< "$text"
+# Stream in 4-char chunks so the demo shows incremental rendering
+# without dropping any whitespace.
+chunk=4
+len=${#text}
+i=0
+while [ $i -lt $len ]; do
+  emit "${text:$i:$chunk}"
+  i=$((i + chunk))
+done
 
 printf 'data: [DONE]\n\n'

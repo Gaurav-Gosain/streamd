@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Emit a long-form response that overflows the viewport, used to demo
-# the alt-screen mode's scrolling.
+# Long-form response that overflows the viewport; used to demo
+# alt-screen scrolling. Streams by character chunks so indentation
+# in code blocks is preserved.
 
 set -e
 
@@ -8,12 +9,13 @@ emit() {
   local content="$1"
   printf 'data: {"choices":[{"delta":{"content":%s}}],"model":"demo"}\n\n' \
     "$(printf '%s' "$content" | jq -Rs .)"
-  sleep 0.02
+  sleep 0.012
 }
 
-text='# Reversing a Linked List in Go
+read -r -d '' text <<'EOF' || true
+# Reversing a Linked List in Go
 
-There are two classic approaches: **iterative** and **recursive**.
+Two classic approaches: **iterative** and **recursive**.
 
 ## Iterative approach
 
@@ -42,7 +44,7 @@ Time complexity: `O(n)`. Space complexity: `O(1)`.
 
 ## Recursive approach
 
-The recursive version is shorter but uses `O(n)` stack space.
+Shorter but uses `O(n)` stack space.
 
 ```go
 func reverseRec(head *Node) *Node {
@@ -58,20 +60,22 @@ func reverseRec(head *Node) *Node {
 
 ## Which one to use?
 
-| Approach  | Time | Space | Notes |
-|-----------|------|-------|-------|
-| Iterative | O(n) | O(1)  | Preferred for production code |
-| Recursive | O(n) | O(n)  | Cleaner but deeper call stack |
+| Approach  | Time | Space | Notes                     |
+|-----------|------|-------|---------------------------|
+| Iterative | O(n) | O(1)  | Preferred for production  |
+| Recursive | O(n) | O(n)  | Cleaner but deeper stack  |
 
 In practice the iterative version wins. Stack overflow is a real
 concern for long lists, and the iterative form is just as readable
-once you have seen it a couple of times.'
+once you have seen it a couple of times.
+EOF
 
-while IFS= read -r line; do
-  for word in $line; do
-    emit "$word "
-  done
-  emit $'\n'
-done <<< "$text"
+chunk=4
+len=${#text}
+i=0
+while [ $i -lt $len ]; do
+  emit "${text:$i:$chunk}"
+  i=$((i + chunk))
+done
 
 printf 'data: [DONE]\n\n'
