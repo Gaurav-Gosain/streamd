@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"strings"
-	"time"
 
 	glamour "charm.land/glamour/v2"
 
@@ -23,57 +22,93 @@ var (
 	tuiDimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#565f89"))
 )
 
+type sseBatchMsg []sseEvent
+
+// waitForSSE blocks until an event arrives, then drains all buffered events.
+func waitForSSE(ch <-chan sseEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return sseBatchMsg{{Done: true}}
+		}
+		if ev.Done {
+			return sseBatchMsg{ev}
+		}
+		batch := sseBatchMsg{ev}
+		for {
+			select {
+			case ev, ok := <-ch:
+				if !ok {
+					batch = append(batch, sseEvent{Done: true})
+					return batch
+				}
+				batch = append(batch, ev)
+				if ev.Done {
+					return batch
+				}
+			default:
+				return batch
+			}
+		}
+	}
+}
+
+// applyBatch processes a batch of events into the model's state.
+func applyBatch(batch sseBatchMsg, thinking, content *string, inThink *bool, meta **streamMeta) (done bool) {
+	for _, ev := range batch {
+		if ev.Meta != nil {
+			*meta = ev.Meta
+		}
+		if ev.Done {
+			done = true
+			continue
+		}
+		if ev.ReasoningContent != "" {
+			*thinking += ev.ReasoningContent
+		}
+		if ev.Content != "" {
+			td, cd, next := parseContent(ev.Content, *inThink)
+			*thinking += td
+			*content += cd
+			*inThink = next
+		}
+	}
+	return done
+}
+
+func renderMd(r *glamour.TermRenderer, thinking, content string, showThink bool) string {
+	md := buildMd(thinking, content, showThink)
+	if md == "" {
+		return ""
+	}
+	out, err := r.Render(md)
+	if err != nil {
+		return md
+	}
+	return out
+}
+
+// --- Alt-screen (interactive) mode ---
+
 type tuiModel struct {
 	viewport   viewport.Model
 	width      int
 	height     int
 	thinking   string
 	content    string
-	displayPos int
 	inThink    bool
 	showThink  bool
 	showInfo   bool
 	styleName  string
 	events     <-chan sseEvent
 	done       bool
-	dirty      bool
 	renderer   *glamour.TermRenderer
 	autoScroll bool
 	meta       *streamMeta
 }
 
-type (
-	sseMsg  sseEvent
-	tickMsg time.Time
-)
-
 func (m tuiModel) Init() tea.Cmd {
-	return tea.Batch(
-		waitForSSE(m.events),
-		tickCmd(0),
-	)
-}
-
-func waitForSSE(ch <-chan sseEvent) tea.Cmd {
-	return func() tea.Msg {
-		ev, ok := <-ch
-		if !ok {
-			return sseMsg{Done: true}
-		}
-		return sseMsg(ev)
-	}
-}
-
-func tickCmd(backlog int) tea.Cmd {
-	// Scale tick speed with backlog: more behind = faster reveal
-	// 30ms at idle, down to 5ms when far behind
-	delay := 30 * time.Millisecond
-	if backlog > 0 {
-		delay = max(5*time.Millisecond, delay/time.Duration(1+backlog/50))
-	}
-	return tea.Tick(delay, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
+	return waitForSSE(m.events)
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -97,73 +132,42 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.viewport.SetWidth(msg.Width)
 		m.viewport.SetHeight(msg.Height - barHeight)
-		// Recreate renderer for new wrap width
 		if r, err := glamour.NewTermRenderer(
 			glamour.WithStandardStyle(m.styleName),
 			glamour.WithWordWrap(msg.Width),
 		); err == nil {
 			m.renderer = r
 		}
-		m.dirty = true
-
-	case sseMsg:
-		if msg.Meta != nil {
-			m.meta = msg.Meta
+		if m.content != "" || m.thinking != "" {
+			m.renderAndSync()
 		}
-		if msg.Done {
-			m.done = true
-			m.dirty = true
+
+	case sseBatchMsg:
+		m.done = applyBatch(msg, &m.thinking, &m.content, &m.inThink, &m.meta)
+		m.renderAndSync()
+		if m.done {
 			return m, nil
 		}
-		if msg.ReasoningContent != "" {
-			m.thinking += msg.ReasoningContent
-			m.dirty = true
-		}
-		if msg.Content != "" {
-			td, cd, next := parseContent(msg.Content, m.inThink)
-			m.thinking += td
-			m.content += cd
-			m.inThink = next
-			m.dirty = true
-		}
 		return m, waitForSSE(m.events)
-
-	case tickMsg:
-		target := len(m.content)
-		advanced := false
-		if m.displayPos < target {
-			if m.done {
-				m.displayPos = target
-			} else {
-				m.displayPos = nextWordBoundary(m.content, m.displayPos)
-			}
-			advanced = true
-		}
-		if m.dirty || advanced {
-			m.dirty = false
-			md := buildMd(m.thinking, m.content[:m.displayPos], m.showThink)
-			if md != "" {
-				out, err := m.renderer.Render(md)
-				if err != nil {
-					out = md
-				}
-				m.viewport.SetContent(out)
-				if m.autoScroll {
-					m.viewport.GotoBottom()
-				}
-			}
-		}
-		return m, tickCmd(target - m.displayPos)
 	}
 
-	// Delegate to viewport for scroll handling (j/k, pgup/pgdn, mouse, etc.)
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
-	// Stop auto-scroll if user scrolled away from bottom
 	if m.viewport.ScrollPercent() < 1.0 {
 		m.autoScroll = false
 	}
 	return m, cmd
+}
+
+func (m *tuiModel) renderAndSync() {
+	out := renderMd(m.renderer, m.thinking, m.content, m.showThink)
+	if out == "" {
+		return
+	}
+	m.viewport.SetContent(out)
+	if m.autoScroll {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m tuiModel) View() tea.View {
@@ -171,7 +175,6 @@ func (m tuiModel) View() tea.View {
 	b.WriteString(m.viewport.View())
 	b.WriteString("\n")
 
-	// Scroll progress bar
 	pct := m.viewport.ScrollPercent()
 	filled := min(int(math.Round(pct*float64(m.width))), m.width)
 	empty := max(0, m.width-filled)
@@ -179,7 +182,6 @@ func (m tuiModel) View() tea.View {
 	b.WriteString(barEmptyStyle.Render(strings.Repeat("─", empty)))
 	b.WriteString("\n")
 
-	// Info bar
 	status := tuiStatusStyle.Render("streaming...")
 	if m.done {
 		status = tuiStatusStyle.Render("done")
@@ -227,38 +229,35 @@ func formatMeta(m *streamMeta) string {
 	return strings.Join(parts, "  ")
 }
 
-// --- Inline mode (no alt screen) ---
+// --- Inline (default) mode ---
+//
+// Streams in alt-screen to keep the main scrollback clean.
+// On exit the alt-screen is discarded and the final output is printed.
 
 type inlineModel struct {
-	thinking   string
-	content    string
-	displayPos int
-	inThink    bool
-	showThink  bool
-	quitting   bool
-	dirty      bool
-	styleName  string
-	width      int
-	height     int
-	events     <-chan sseEvent
-	done       bool
-	renderer   *glamour.TermRenderer
-	meta       *streamMeta
-	rendered   string
+	thinking  string
+	content   string
+	inThink   bool
+	showThink bool
+	styleName string
+	width     int
+	height    int
+	events    <-chan sseEvent
+	done      bool
+	renderer  *glamour.TermRenderer
+	meta      *streamMeta
+	rendered  string
 }
 
 func (m inlineModel) Init() tea.Cmd {
-	return tea.Batch(
-		waitForSSE(m.events),
-		tickCmd(0),
-	)
+	return waitForSSE(m.events)
 }
 
 func (m inlineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
-			m.quitting = true
+			m.done = true
 			return m, tea.Quit
 		}
 
@@ -272,68 +271,20 @@ func (m inlineModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderer = r
 		}
 
-	case sseMsg:
-		if msg.Meta != nil {
-			m.meta = msg.Meta
-		}
-		if msg.Done {
-			m.done = true
-			m.dirty = true
-			return m, nil
-		}
-		if msg.ReasoningContent != "" {
-			m.thinking += msg.ReasoningContent
-			m.dirty = true
-		}
-		if msg.Content != "" {
-			td, cd, next := parseContent(msg.Content, m.inThink)
-			m.thinking += td
-			m.content += cd
-			m.inThink = next
-			m.dirty = true
-		}
-		return m, waitForSSE(m.events)
-
-	case tickMsg:
-		target := len(m.content)
-		advanced := false
-		if m.displayPos < target {
-			if m.done {
-				m.displayPos = target
-			} else {
-				m.displayPos = nextWordBoundary(m.content, m.displayPos)
-			}
-			advanced = true
-		}
-		if m.dirty || advanced {
-			m.dirty = false
-			md := buildMd(m.thinking, m.content[:m.displayPos], m.showThink)
-			if md != "" {
-				out, err := m.renderer.Render(md)
-				if err != nil {
-					out = md
-				}
-				m.rendered = out
-			}
-		}
-		if m.done && m.displayPos >= target {
-			m.quitting = true
+	case sseBatchMsg:
+		m.done = applyBatch(msg, &m.thinking, &m.content, &m.inThink, &m.meta)
+		m.rendered = renderMd(m.renderer, m.thinking, m.content, m.showThink)
+		if m.done {
 			return m, tea.Quit
 		}
-		return m, tickCmd(target - m.displayPos)
+		return m, waitForSSE(m.events)
 	}
 
 	return m, nil
 }
 
 func (m inlineModel) View() tea.View {
-	if m.quitting {
-		// Clear bubbletea's view area so the post-exit print is clean
-		return tea.NewView("")
-	}
-
 	out := m.rendered
-	// Cap to terminal height so bubbletea never pushes into scrollback
 	if m.height > 0 {
 		lines := strings.Split(out, "\n")
 		if len(lines) > m.height {
@@ -341,17 +292,16 @@ func (m inlineModel) View() tea.View {
 		}
 		out = strings.Join(lines, "\n")
 	}
-
 	return tea.NewView(out)
 }
+
+// --- Run functions ---
 
 func openTTY() (*os.File, func(), error) {
 	tty, err := os.Open("/dev/tty")
 	if err == nil {
 		return tty, func() { tty.Close() }, nil
 	}
-	// Fallback: pipe gives no input but supports epoll;
-	// Ctrl+C is handled via SIGINT.
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot open terminal for input: %w", err)
@@ -385,31 +335,24 @@ func runInline(style string, width int, showThink, showInfo bool) error {
 	}
 	defer cleanup()
 
+	// Stream in alt-screen so no artifacts leak into scrollback.
+	fmt.Fprint(os.Stdout, "\033[?1049h")
 	p := tea.NewProgram(m, tea.WithInput(tty))
 	result, err := p.Run()
+	fmt.Fprint(os.Stdout, "\033[?1049l")
+
 	if err != nil {
 		return err
 	}
 
-	// Print the full rendered output so it stays in scrollback
-	if im, ok := result.(inlineModel); ok {
-		md := buildMd(im.thinking, im.content, im.showThink)
-		if md != "" {
-			out, renderErr := im.renderer.Render(md)
-			if renderErr != nil {
-				out = md
-			}
-			fmt.Print(out)
-		}
+	if im, ok := result.(inlineModel); ok && im.rendered != "" {
+		fmt.Print(im.rendered)
 		if showInfo && im.meta != nil {
-			printMeta(im.meta)
+			printMetaStderr(im.meta)
 		}
 	}
-
 	return nil
 }
-
-// --- Alt-screen mode ---
 
 func runTUI(style string, width int, showThink, showInfo bool) error {
 	r, err := glamour.NewTermRenderer(
@@ -433,7 +376,6 @@ func runTUI(style string, width int, showThink, showInfo bool) error {
 		autoScroll: true,
 	}
 
-	// Read key input from /dev/tty since stdin is piped with SSE data
 	tty, cleanup, err := openTTY()
 	if err != nil {
 		return err
@@ -443,4 +385,24 @@ func runTUI(style string, width int, showThink, showInfo bool) error {
 	p := tea.NewProgram(m, tea.WithInput(tty))
 	_, err = p.Run()
 	return err
+}
+
+func printMetaStderr(m *streamMeta) {
+	var parts []string
+	if m.Model != "" {
+		parts = append(parts, "model: "+m.Model)
+	}
+	if m.FinishReason != "" {
+		parts = append(parts, "finish: "+m.FinishReason)
+	}
+	if m.TotalTokens > 0 {
+		parts = append(parts, fmt.Sprintf("tokens: %d prompt + %d completion = %d total",
+			m.PromptTokens, m.CompletionTokens, m.TotalTokens))
+	} else if m.PromptEvalCount > 0 || m.EvalCount > 0 {
+		parts = append(parts, fmt.Sprintf("tokens: %d prompt + %d eval",
+			m.PromptEvalCount, m.EvalCount))
+	}
+	if len(parts) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[2m%s\033[0m\n", strings.Join(parts, "  |  "))
+	}
 }

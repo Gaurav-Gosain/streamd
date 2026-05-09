@@ -16,7 +16,6 @@ import (
 	"golang.org/x/term"
 )
 
-// Version information (set by goreleaser).
 var (
 	version = "dev"
 	commit  = "none"
@@ -31,7 +30,6 @@ type options struct {
 	wrap    int
 }
 
-// sseEvent is the internal representation of a parsed streaming event.
 type sseEvent struct {
 	ReasoningContent string
 	Content          string
@@ -39,21 +37,19 @@ type sseEvent struct {
 	Meta             *streamMeta
 }
 
-// streamMeta carries optional metadata from the final chunk(s).
 type streamMeta struct {
 	Model            string
 	FinishReason     string
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
-	// Ollama-specific
-	TotalDuration   time.Duration
-	PromptEvalCount int
-	EvalCount       int
+	TotalDuration    time.Duration
+	PromptEvalCount  int
+	EvalCount        int
 }
 
-// universalChunk handles OpenAI Chat Completions, Ollama /api/chat,
-// Ollama /api/generate, and non-streaming responses.
+// universalChunk covers OpenAI Chat Completions, Ollama /api/chat,
+// and Ollama /api/generate formats.
 type universalChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -74,18 +70,10 @@ type universalChunk struct {
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
 
-	// Ollama /api/chat
-	Message struct {
-		Content string `json:"content"`
-	} `json:"message"`
+	Message  struct{ Content string `json:"content"` } `json:"message"`
+	Response string                                     `json:"response"`
+	Thinking string                                     `json:"thinking"`
 
-	// Ollama /api/generate
-	Response string `json:"response"`
-
-	// Ollama thinking/reasoning (e.g. qwen3)
-	Thinking string `json:"thinking"`
-
-	// Ollama flags & metadata
 	Done            bool   `json:"done"`
 	DoneReason      string `json:"done_reason"`
 	TotalDuration   int64  `json:"total_duration"`
@@ -93,7 +81,6 @@ type universalChunk struct {
 	EvalCount       int    `json:"eval_count"`
 }
 
-// responsesEvent handles OpenAI Responses API streaming events.
 type responsesEvent struct {
 	Type     string `json:"type"`
 	Delta    string `json:"delta"`
@@ -107,9 +94,7 @@ type responsesEvent struct {
 	} `json:"response"`
 }
 
-// parseLine auto-detects the format and extracts content from a line of input.
 func parseLine(line string) sseEvent {
-	// SSE: lines prefixed with "data: "
 	if data, ok := strings.CutPrefix(line, "data: "); ok {
 		if data == "[DONE]" {
 			return sseEvent{Done: true}
@@ -117,28 +102,22 @@ func parseLine(line string) sseEvent {
 		return parseJSON(data)
 	}
 
-	// Skip empty lines and SSE comments/event lines
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" || strings.HasPrefix(trimmed, "event:") || strings.HasPrefix(trimmed, ":") {
 		return sseEvent{}
 	}
 
-	// JSON line: try structured formats first
 	if trimmed[0] == '{' {
 		if ev := parseJSON(trimmed); ev.Content != "" || ev.ReasoningContent != "" || ev.Done || ev.Meta != nil {
 			return ev
 		}
 	}
 
-	// Plain text fallback (e.g. ollama run, cat, echo)
 	return sseEvent{Content: line + "\n"}
 }
 
 func parseJSON(data string) sseEvent {
-	// Check for Responses API events (have a "type" field)
-	var peek struct {
-		Type string `json:"type"`
-	}
+	var peek struct{ Type string `json:"type"` }
 	if json.Unmarshal([]byte(data), &peek) == nil && peek.Type != "" {
 		return parseResponsesEvent(data, peek.Type)
 	}
@@ -148,20 +127,15 @@ func parseJSON(data string) sseEvent {
 		return sseEvent{}
 	}
 
-	// OpenAI Chat Completions format
 	if len(c.Choices) > 0 {
 		ch := c.Choices[0]
 
-		// Streaming usage-only chunk (empty choices with usage)
 		if ch.Delta.Content == "" && ch.Delta.ReasoningContent == "" &&
 			ch.Message.Content == "" && ch.Message.ReasoningContent == "" &&
 			c.Usage != nil {
-			return sseEvent{
-				Meta: buildMetaFromChat(&c, ch.FinishReason),
-			}
+			return sseEvent{Meta: buildMetaFromChat(&c, ch.FinishReason)}
 		}
 
-		// Streaming: delta field
 		if ch.Delta.Content != "" || ch.Delta.ReasoningContent != "" {
 			ev := sseEvent{
 				Content:          ch.Delta.Content,
@@ -173,7 +147,6 @@ func parseJSON(data string) sseEvent {
 			return ev
 		}
 
-		// Non-streaming: message field
 		if ch.Message.Content != "" || ch.Message.ReasoningContent != "" {
 			return sseEvent{
 				Content:          ch.Message.Content,
@@ -184,7 +157,6 @@ func parseJSON(data string) sseEvent {
 		}
 	}
 
-	// Ollama /api/chat
 	if c.Message.Content != "" || c.Thinking != "" {
 		ev := sseEvent{Content: c.Message.Content, ReasoningContent: c.Thinking, Done: c.Done}
 		if c.Done {
@@ -193,7 +165,6 @@ func parseJSON(data string) sseEvent {
 		return ev
 	}
 
-	// Ollama /api/generate
 	if c.Response != "" || c.Thinking != "" {
 		ev := sseEvent{Content: c.Response, ReasoningContent: c.Thinking, Done: c.Done}
 		if c.Done {
@@ -202,7 +173,6 @@ func parseJSON(data string) sseEvent {
 		return ev
 	}
 
-	// Ollama final metadata-only chunk (done:true, no content)
 	if c.Done {
 		return sseEvent{Done: true, Meta: buildMetaFromOllama(&c)}
 	}
@@ -275,28 +245,27 @@ endpoints and renders the markdown output in the terminal using glamour.
 Supported formats:
   - OpenAI Chat Completions SSE (streaming and non-streaming)
   - OpenAI Responses API (response.output_text.delta events)
-  - Ollama /api/chat (NDJSON)
-  - Ollama /api/generate (NDJSON)
+  - Ollama /api/chat and /api/generate (NDJSON)
 
 Supports thinking/reasoning tokens via the 'reasoning_content' field
 and inline <think>...</think> tags.`,
-		Example: `  # OpenAI-compatible endpoint:
-  curl -s https://api.example.com/v1/chat/completions \
+		Example: `  # OpenAI-compatible (use -N to disable curl buffering):
+  curl -sN https://api.example.com/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{"model":"...","messages":[...],"stream":true}' | streamd
 
-  # Ollama native:
-  curl -s http://localhost:11434/api/chat \
+  # Ollama:
+  curl -sN http://localhost:11434/api/chat \
     -d '{"model":"gemma3:4b","messages":[...],"stream":true}' | streamd
 
   # With usage info:
-  curl -s ... | streamd --info
+  curl -sN ... | streamd --info
 
-  # Alt-screen with scrollable viewport:
-  curl -s ... | streamd --alt
+  # Interactive alt-screen with scrollable viewport:
+  curl -sN ... | streamd --alt
 
   # Hide thinking:
-  curl -s ... | streamd --no-think`,
+  curl -sN ... | streamd --no-think`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -350,47 +319,6 @@ func run(opts options) error {
 	return runInline(style, width, showThink, opts.info)
 }
 
-// nextWordBoundary returns the byte offset just past the next word after pos.
-func nextWordBoundary(s string, pos int) int {
-	i := strings.IndexAny(s[pos:], " \t\n")
-	if i < 0 {
-		return len(s)
-	}
-	return pos + i + 1
-}
-
-func printMeta(m *streamMeta) {
-	dim := "\033[2m"
-	reset := "\033[0m"
-
-	var parts []string
-	if m.Model != "" {
-		parts = append(parts, "model: "+m.Model)
-	}
-	if m.FinishReason != "" {
-		parts = append(parts, "finish: "+m.FinishReason)
-	}
-	if m.TotalTokens > 0 {
-		parts = append(parts, fmt.Sprintf("tokens: %d prompt + %d completion = %d total",
-			m.PromptTokens, m.CompletionTokens, m.TotalTokens))
-	} else if m.PromptEvalCount > 0 || m.EvalCount > 0 {
-		parts = append(parts, fmt.Sprintf("tokens: %d prompt + %d eval",
-			m.PromptEvalCount, m.EvalCount))
-	}
-	if m.TotalDuration > 0 {
-		parts = append(parts, fmt.Sprintf("duration: %s", m.TotalDuration.Round(time.Millisecond)))
-		if m.EvalCount > 0 {
-			tps := float64(m.EvalCount) / m.TotalDuration.Seconds()
-			parts = append(parts, fmt.Sprintf("speed: %.1f tok/s", tps))
-		}
-	}
-
-	if len(parts) > 0 {
-		fmt.Fprintf(os.Stderr, "%s%s%s\n", dim, strings.Join(parts, "  |  "), reset)
-	}
-}
-
-// parseContent splits text into thinking/content deltas, handling <think> tags.
 func parseContent(text string, inThink bool) (thinkDelta, contentDelta string, newInThink bool) {
 	var tb, cb strings.Builder
 	rest := text
@@ -418,7 +346,6 @@ func parseContent(text string, inThink bool) (thinkDelta, contentDelta string, n
 	return tb.String(), cb.String(), inThink
 }
 
-// buildMd composes the final markdown from thinking + content.
 func buildMd(thinking, content string, showThink bool) string {
 	var sb strings.Builder
 	if showThink && thinking != "" {
@@ -436,7 +363,6 @@ func buildMd(thinking, content string, showThink bool) string {
 	return sb.String()
 }
 
-// readEvents reads streaming events from stdin (any supported format) and sends them to ch.
 func readEvents(ch chan<- sseEvent) {
 	defer close(ch)
 	scanner := bufio.NewScanner(os.Stdin)
