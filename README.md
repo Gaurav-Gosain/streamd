@@ -8,7 +8,11 @@
 
 ---
 
-streamd takes piped input from any LLM CLI or API endpoint and renders it as beautifully formatted markdown in the terminal. It auto-detects the input format and just works — whether you're piping from `curl`, `ollama run`, or plain text.
+<p align="center">
+  <img alt="streamd rendering streamed markdown in the terminal" src="vhs/out/hero.gif">
+</p>
+
+streamd takes piped input from any LLM CLI or API endpoint and renders it as beautifully formatted markdown in the terminal. It auto-detects the input format and just works, whether you're piping from `curl`, `ollama run`, or plain text.
 
 <details>
 <summary>Table of Contents</summary>
@@ -19,6 +23,7 @@ streamd takes piped input from any LLM CLI or API endpoint and renders it as bea
 - [Features](#features)
 - [Modes](#modes)
 - [Thinking / Reasoning Support](#thinking--reasoning-support)
+- [Usage Info](#usage-info)
 - [Development](#development)
 - [License](#license)
 
@@ -46,20 +51,24 @@ brew install streamd
 
 ## Usage
 
+> **Tip:** when piping from `curl`, use `-N` (`--no-buffer`) so each SSE
+> event is flushed immediately. Without it curl batches output until
+> its pipe buffer fills, which makes the stream look frozen.
+
 ```bash
-# Ollama CLI — just pipe it
+# Ollama CLI, just pipe it
 ollama run gemma3:4b "explain quicksort" | streamd
 
 # Ollama native /api/chat
-curl -s http://localhost:11434/api/chat \
+curl -sN http://localhost:11434/api/chat \
   -d '{"model":"gemma3:4b","messages":[{"role":"user","content":"hello"}],"stream":true}' | streamd
 
 # Ollama /api/generate
-curl -s http://localhost:11434/api/generate \
+curl -sN http://localhost:11434/api/generate \
   -d '{"model":"gemma3:4b","prompt":"explain quicksort","stream":true}' | streamd
 
 # OpenAI-compatible endpoint
-curl -s https://api.example.com/v1/chat/completions \
+curl -sN https://api.example.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"...","messages":[{"role":"user","content":"hello"}],"stream":true}' | streamd
 
@@ -71,14 +80,14 @@ echo "# Hello **world**" | streamd
 ollama run gemma3:4b "explain quicksort" | streamd --alt
 
 # Show model info and token usage
-curl -s http://localhost:11434/api/chat \
+curl -sN http://localhost:11434/api/chat \
   -d '{"model":"gemma3:4b","messages":[...],"stream":true}' | streamd --info
 
 # Hide thinking/reasoning output
-curl -s ... | streamd --no-think
+curl -sN ... | streamd --no-think
 
 # Use a different glamour theme
-curl -s ... | streamd --style dracula
+curl -sN ... | streamd --style dracula
 ```
 
 ### Flags
@@ -107,13 +116,14 @@ streamd auto-detects the input format — no flags or configuration needed.
 
 ## Features
 
-- **Live markdown rendering** using [glamour](https://github.com/charmbracelet/glamour) (v2-exp) with syntax-highlighted code blocks, styled headings, lists, tables, and more
-- **Universal input** — auto-detects SSE, NDJSON, and plain text so it works with any LLM tool
-- **Flicker-free streaming** via synchronized terminal output (`DECSYNC`) and debounced re-rendering
+- **Live markdown rendering** using [glamour](https://github.com/charmbracelet/glamour) v2 with syntax-highlighted code blocks, styled headings, lists, tables, and more
+- **Universal input**: auto-detects SSE, NDJSON, and plain text so it works with any LLM tool
+- **Event-driven rendering** with batched SSE reads for instant first-token display
 - **Thinking/reasoning support** for models that expose chain-of-thought, via the `reasoning_content` SSE field or inline `<think>...</think>` tags
-- **Usage info** (`--info`) — shows model name, token counts, speed (tok/s), and duration
+- **Clean scrollback**: inline mode streams in an alt-screen and prints the final output in one shot, so the result looks like a single command output
 - **Interactive alt-screen mode** powered by [bubbletea](https://github.com/charmbracelet/bubbletea) with a scrollable viewport, scroll progress bar, and keyboard navigation
-- **Multiple themes** including dark, light, dracula, tokyo-night, and pink
+- **Usage info** (`--info`): model name, token counts, speed (tok/s), and duration on stderr
+- **Multiple themes**: dark, light, dracula, tokyo-night, pink, ascii
 - **Auto-detected terminal width** for proper word wrapping
 - **Styled CLI help** via [fang](https://github.com/charmbracelet/fang)
 
@@ -121,11 +131,15 @@ streamd auto-detects the input format — no flags or configuration needed.
 
 ### Inline Mode (default)
 
-Content is rendered directly in the terminal as it streams. The output uses ANSI cursor control with synchronized output to re-render in place without flicker. Best for quick queries where you want the output to remain in your scrollback.
+<p align="center"><img alt="streamd inline mode" src="vhs/out/inline.gif"></p>
+
+The live view is rendered in an alt-screen so the terminal scrollback stays clean. When streaming finishes the alt-screen is dismissed and the final rendered output is printed in one shot, so the result reads as a single command output.
 
 ### Alt-Screen Mode (`--alt`)
 
-Opens a full-screen interactive viewport. The stream auto-scrolls to follow new content. Once streaming is complete (or at any point), you can scroll through the output and quit when ready.
+<p align="center"><img alt="streamd alt-screen mode" src="vhs/out/alt.gif"></p>
+
+Opens a full-screen interactive viewport with a scroll bar and status line. The stream auto-scrolls to follow new content; scrolling up pauses auto-scroll and `G` resumes it.
 
 #### Keyboard Shortcuts
 
@@ -141,15 +155,23 @@ The viewport auto-scrolls to follow the stream. Scrolling up pauses auto-scroll;
 
 ## Thinking / Reasoning Support
 
+<p align="center"><img alt="streamd rendering reasoning_content followed by the final answer" src="vhs/out/thinking.gif"></p>
+
 streamd supports models that expose their reasoning process. It handles two common patterns:
 
-1. **`reasoning_content` field** (OpenAI-compatible) - Reasoning tokens arrive in a separate `reasoning_content` field in the SSE delta, used by models like Qwen, DeepSeek, and others.
+1. **`reasoning_content` field** (OpenAI-compatible). Reasoning tokens arrive in a separate `reasoning_content` field in the SSE delta, used by models like Qwen, DeepSeek, and others.
 
-2. **`<think>` tags** - Some models wrap their reasoning in `<think>...</think>` tags within the regular `content` field.
+2. **`<think>` tags**. Some models wrap their reasoning in `<think>...</think>` tags within the regular `content` field.
 
 Both patterns are detected automatically. Thinking content is rendered as an italic header followed by a blockquote, separated from the main response by a horizontal rule.
 
 Use `--no-think` to hide reasoning output entirely.
+
+## Usage Info
+
+<p align="center"><img alt="streamd --info shows model and token usage" src="vhs/out/info.gif"></p>
+
+Pass `--info` (or `-i`) and streamd will print the model name, prompt/completion token counts, and (for Ollama) eval speed once the response completes. The info line goes to stderr so it doesn't pollute piped output.
 
 ## Development
 
@@ -162,6 +184,8 @@ cd streamd
 go build -o streamd .
 ./streamd --help
 ```
+
+**Regenerate README GIFs:** the `vhs/` directory holds [VHS](https://github.com/charmbracelet/vhs) tape scripts and a Makefile that builds every GIF embedded above. See [`vhs/README.md`](vhs/README.md).
 
 ### Dependencies
 
